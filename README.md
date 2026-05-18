@@ -14,7 +14,7 @@ Use Claude Code CLI, VS Code, JetBrains ACP, or chat bots through your own Anthr
 
 Free Claude Code routes Anthropic Messages API traffic from Claude Code to NVIDIA NIM, Kimi, Wafer, OpenRouter, DeepSeek, LM Studio, llama.cpp, or Ollama. It keeps Claude Code's client-side protocol stable while letting you choose free, paid, or local models.
 
-[Quick Start](#quick-start) · [Providers](#choose-a-provider) · [Clients](#connect-claude-code) · [Integrations](#optional-integrations) · [Development](#development)
+[Quick Start](#quick-start) · [Providers](#choose-a-provider) · [Fallback Chain](#12-provider-chain-fallback) · [Clients](#connect-claude-code) · [Integrations](#optional-integrations) · [Development](#development)
 
 </div>
 
@@ -39,6 +39,8 @@ Free Claude Code routes Anthropic Messages API traffic from Claude Code to NVIDI
 - Drop-in proxy for Claude Code's Anthropic API calls.
 - Ten provider backends: NVIDIA NIM, Kimi, Wafer, OpenRouter, DeepSeek, LM Studio, llama.cpp, Ollama, OpenCode Zen, and Z.ai.
 - Per-model routing: send Opus, Sonnet, Haiku, and fallback traffic to different providers.
+- **Automatic provider fallback**: list multiple providers per tier as a comma-separated chain; the proxy advances to the next candidate on rate-limit, auth, missing-model, or 5xx errors before any tokens are streamed. See [Provider Chain Fallback](#12-provider-chain-fallback).
+- **Non-streaming JSON responses**: omit `stream` (or send `stream: false`) and the proxy aggregates SSE into a single JSON `message` — unlocks LiteLLM, the OpenAI SDK's Anthropic adapter, `browser-use`, and any client that expects a JSON body. See [Use With OpenAI-Compatible Clients](#use-with-openai-compatible-clients).
 - Native Claude Code `/model` picker support through the proxy's `/v1/models` endpoint (Claude Code must opt in to Gateway model discovery; see [Model Picker](#model-picker)).
 - Streaming, tool use, reasoning/thinking block handling, and local request optimizations.
 - Optional Discord or Telegram bot wrapper for remote coding sessions.
@@ -247,6 +249,35 @@ Each model tier can use a different provider by setting `MODEL_OPUS`, `MODEL_SON
 
 For example, you can route Opus to `nvidia_nim/moonshotai/kimi-k2.5`, Sonnet to `open_router/deepseek/deepseek-r1-0528:free`, Haiku to `lmstudio/unsloth/GLM-4.7-Flash-GGUF`, and keep the fallback `MODEL` on `zai/glm-5.1`.
 
+### 12. Provider Chain Fallback
+
+`MODEL`, `MODEL_OPUS`, `MODEL_SONNET`, and `MODEL_HAIKU` accept a **comma-separated chain** of provider-prefixed slugs. The proxy tries each candidate in order and automatically advances to the next one whenever the upstream returns a retryable error **before** any tokens have been streamed back to the client.
+
+Example `.env`:
+
+```bash
+MODEL_OPUS=nvidia_nim/moonshotai/kimi-k2.5,open_router/deepseek/deepseek-chat-v3-0324:free,nvidia_nim/qwen/qwen3-coder
+MODEL_SONNET=open_router/qwen/qwen3-coder:free,nvidia_nim/openai/gpt-oss-120b,open_router/z-ai/glm-4.6:free
+MODEL_HAIKU=nvidia_nim/openai/gpt-oss-20b,open_router/google/gemini-2.0-flash-exp:free
+MODEL=nvidia_nim/z-ai/glm4.7
+```
+
+Whitespace around commas is ignored, so the chain stays readable.
+
+**Fallback fires only on pre-stream errors** so partial responses are never replayed:
+
+- HTTP `401`, `403` — auth or quota rejection.
+- HTTP `404`, `410` — provider removed the model.
+- HTTP `429` — rate limit.
+- HTTP `5xx` — provider outage.
+- Network / transport errors (DNS, timeout, connection reset).
+
+Once the upstream has emitted the first SSE event, the chosen provider owns the response. If it later fails mid-stream, the error surfaces to the client unchanged — the proxy will not silently retry, because mid-stream switching would produce duplicate or contradictory output.
+
+When every candidate in the chain fails before streaming, the proxy returns the **last** error it saw with the upstream provider context preserved, so the client can see which slugs were tried.
+
+This makes free-tier providers (OpenRouter `:free` models, NIM, etc.) practical for daily use: when one rate-limits you, the next in the chain takes over without any client-side retry logic.
+
 ## Connect Claude Code
 
 ### 1. Claude Code CLI
@@ -299,6 +330,34 @@ Restart the IDE after changing the file.
 <div align="center">
   <img src="assets/cc-model-picker.png" alt="Claude Code model picker showing gateway models" width="700">
 </div>
+
+## Use With OpenAI-Compatible Clients
+
+The proxy follows the full Anthropic Messages contract on `/v1/messages`. When the request omits `stream` (or sends `stream: false`), the proxy aggregates the upstream SSE events into a single JSON `message` — matching the behavior of `api.anthropic.com`.
+
+That unlocks any client that speaks the Anthropic JSON contract but does not parse SSE:
+
+- [**LiteLLM**](https://github.com/BerriAI/litellm) — `litellm.completion(model="anthropic/claude-sonnet-4-20250514", api_base="http://localhost:8082", api_key="freecc", ...)`.
+- The **Anthropic Python SDK** with a custom `base_url`.
+- [**browser-use**](https://github.com/browser-use/browser-use) and other agent frameworks that route their LLM calls through LiteLLM or the Anthropic SDK.
+- Plain `curl` / `httpx` / `requests` integrations that expect a JSON response body.
+
+Single-shot example:
+
+```bash
+curl http://localhost:8082/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: freecc" \
+  -d '{
+    "model": "claude-sonnet-4-20250514",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "max_tokens": 256
+  }'
+```
+
+The response is a single JSON `message` object (with `content`, `usage`, `stop_reason`, etc.) — no SSE parsing required.
+
+Sending `stream: true` keeps the SSE behavior Claude Code uses internally, and both modes honor the [Provider Chain Fallback](#12-provider-chain-fallback) order.
 
 ## Optional Integrations
 
