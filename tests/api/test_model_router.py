@@ -203,7 +203,9 @@ def test_model_router_logs_mapping(settings):
 
 
 def test_model_router_resolve_chain_expands_comma_list(settings):
-    settings.model_opus = "nvidia_nim/big,open_router/qwen/qwen3-coder:free,nvidia_nim/small"
+    settings.model_opus = (
+        "nvidia_nim/big,open_router/qwen/qwen3-coder:free,nvidia_nim/small"
+    )
 
     chain = ModelRouter(settings).resolve_chain("claude-opus-4-20250514")
 
@@ -227,7 +229,9 @@ def test_model_router_resolve_returns_first_chain_entry(settings):
     assert resolved.provider_model == "primary"
 
 
-def test_model_router_resolve_chain_single_entry_for_direct_model(settings):
+def test_model_router_resolve_chain_single_entry_for_unknown_direct_model(settings):
+    # The direct ref does not appear in any configured chain (fixture only sets
+    # MODEL=nvidia_nim/fallback-model), so the chain stays single-entry.
     chain = ModelRouter(settings).resolve_chain(
         "anthropic/nvidia_nim/deepseek-ai/deepseek-v4-pro"
     )
@@ -235,6 +239,109 @@ def test_model_router_resolve_chain_single_entry_for_direct_model(settings):
     assert len(chain) == 1
     assert chain[0].provider_id == "nvidia_nim"
     assert chain[0].provider_model == "deepseek-ai/deepseek-v4-pro"
+
+
+def test_model_router_pinned_direct_model_extends_chain_from_model_opus(settings):
+    settings.model_opus = (
+        "nvidia_nim/qwen/qwen3-coder-480b-a35b-instruct,"
+        "nvidia_nim/openai/gpt-oss-120b,"
+        "open_router/qwen/qwen3-coder:free"
+    )
+
+    chain = ModelRouter(settings).resolve_chain(
+        "nvidia_nim/qwen/qwen3-coder-480b-a35b-instruct"
+    )
+
+    assert [entry.provider_model_ref for entry in chain] == [
+        "nvidia_nim/qwen/qwen3-coder-480b-a35b-instruct",
+        "nvidia_nim/openai/gpt-oss-120b",
+        "open_router/qwen/qwen3-coder:free",
+    ]
+    for entry in chain:
+        assert entry.original_model == "nvidia_nim/qwen/qwen3-coder-480b-a35b-instruct"
+
+
+def test_model_router_pinned_gateway_encoded_model_extends_chain(settings):
+    settings.model_opus = (
+        "nvidia_nim/qwen/qwen3-coder-480b-a35b-instruct,"
+        "open_router/qwen/qwen3-coder:free"
+    )
+
+    chain = ModelRouter(settings).resolve_chain(
+        "anthropic/nvidia_nim/qwen/qwen3-coder-480b-a35b-instruct"
+    )
+
+    assert len(chain) == 2
+    # The pinned entry keeps the gateway-encoded id so logs/responses preserve
+    # what the client actually sent.
+    assert chain[0].provider_id == "nvidia_nim"
+    assert chain[0].provider_model == "qwen/qwen3-coder-480b-a35b-instruct"
+    assert (
+        chain[0].provider_model_ref
+        == "anthropic/nvidia_nim/qwen/qwen3-coder-480b-a35b-instruct"
+    )
+    assert chain[1].provider_model_ref == "open_router/qwen/qwen3-coder:free"
+
+
+def test_model_router_pinned_direct_model_prefers_opus_chain_over_sonnet(settings):
+    settings.model_opus = "nvidia_nim/shared,nvidia_nim/opus-fallback"
+    settings.model_sonnet = "nvidia_nim/shared,nvidia_nim/sonnet-fallback"
+
+    chain = ModelRouter(settings).resolve_chain("nvidia_nim/shared")
+
+    assert len(chain) == 2
+    assert chain[1].provider_model_ref == "nvidia_nim/opus-fallback"
+
+
+def test_model_router_pinned_direct_model_skips_chain_with_no_tail(settings):
+    # MODEL_OPUS has the ref but no tail; should fall through to MODEL_SONNET.
+    settings.model_opus = "nvidia_nim/qwen/qwen3-coder-480b-a35b-instruct"
+    settings.model_sonnet = (
+        "nvidia_nim/qwen/qwen3-coder-480b-a35b-instruct,"
+        "open_router/qwen/qwen3-coder:free"
+    )
+
+    chain = ModelRouter(settings).resolve_chain(
+        "nvidia_nim/qwen/qwen3-coder-480b-a35b-instruct"
+    )
+
+    assert len(chain) == 2
+    assert chain[1].provider_model_ref == "open_router/qwen/qwen3-coder:free"
+
+
+def test_model_router_pinned_direct_model_logs_extended_chain(settings):
+    settings.model_opus = (
+        "nvidia_nim/qwen/qwen3-coder-480b-a35b-instruct,"
+        "open_router/qwen/qwen3-coder:free"
+    )
+
+    with patch("api.model_router.logger.debug") as mock_log:
+        ModelRouter(settings).resolve_chain(
+            "anthropic/nvidia_nim/qwen/qwen3-coder-480b-a35b-instruct"
+        )
+
+    mock_log.assert_called()
+    args = mock_log.call_args[0]
+    assert "MODEL CHAIN" in args[0]
+
+
+def test_model_router_pinned_direct_model_resolve_messages_request_chain(settings):
+    settings.model_opus = (
+        "nvidia_nim/qwen/qwen3-coder-480b-a35b-instruct,"
+        "open_router/qwen/qwen3-coder:free"
+    )
+
+    request = MessagesRequest(
+        model="anthropic/nvidia_nim/qwen/qwen3-coder-480b-a35b-instruct",
+        max_tokens=50,
+        messages=[Message(role="user", content="hi")],
+    )
+    routed_chain = ModelRouter(settings).resolve_messages_request_chain(request)
+
+    assert len(routed_chain.candidates) == 2
+    assert routed_chain.primary.request.model == "qwen/qwen3-coder-480b-a35b-instruct"
+    assert routed_chain.candidates[1].request.model == "qwen/qwen3-coder:free"
+    assert request.model == "anthropic/nvidia_nim/qwen/qwen3-coder-480b-a35b-instruct"
 
 
 def test_model_router_resolve_messages_request_chain(settings):

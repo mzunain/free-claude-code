@@ -58,9 +58,16 @@ class ModelRouter:
     def resolve_chain(self, claude_model_name: str) -> tuple[ResolvedModel, ...]:
         """Resolve a Claude model name to an ordered chain of fallback candidates.
 
+        Aliases (claude-opus-/claude-sonnet-/claude-haiku-/claude-N.M) expand into
+        the configured MODEL_OPUS/SONNET/HAIKU/MODEL fallback chain.
+
         Direct provider model ids (``provider/model`` or ``anthropic/provider/model``)
-        always resolve to a single-entry chain. MODEL_OPUS/SONNET/HAIKU expand into
-        the full comma-separated fallback list configured in settings.
+        resolve to a single-entry chain by default. If the same ref appears in any
+        configured chain (searched in priority order MODEL_OPUS, MODEL_SONNET,
+        MODEL_HAIKU, MODEL), the chain is extended with the entries that follow
+        the matching position. This lets a pinned model selected from Claude
+        Code's ``/model`` picker still fall over to other providers when its
+        upstream is rate-limited.
         """
         (
             direct_provider_id,
@@ -73,15 +80,36 @@ class ModelRouter:
                 if force_thinking_enabled is not None
                 else self._settings.resolve_thinking(direct_provider_model)
             )
-            return (
+            first = ResolvedModel(
+                original_model=claude_model_name,
+                provider_id=direct_provider_id,
+                provider_model=direct_provider_model,
+                provider_model_ref=claude_model_name,
+                thinking_enabled=thinking_enabled,
+            )
+            fallback_refs = self._fallback_refs_after(
+                f"{direct_provider_id}/{direct_provider_model}"
+            )
+            if not fallback_refs:
+                return (first,)
+
+            extended_chain: list[ResolvedModel] = [first]
+            extended_chain.extend(
                 ResolvedModel(
                     original_model=claude_model_name,
-                    provider_id=direct_provider_id,
-                    provider_model=direct_provider_model,
-                    provider_model_ref=claude_model_name,
+                    provider_id=Settings.parse_provider_type(provider_model_ref),
+                    provider_model=Settings.parse_model_name(provider_model_ref),
+                    provider_model_ref=provider_model_ref,
                     thinking_enabled=thinking_enabled,
-                ),
+                )
+                for provider_model_ref in fallback_refs
             )
+            logger.debug(
+                "MODEL CHAIN: '{}' -> {}",
+                claude_model_name,
+                [c.provider_model_ref for c in extended_chain],
+            )
+            return tuple(extended_chain)
 
         thinking_enabled = self._settings.resolve_thinking(claude_model_name)
         chain_refs = self._settings.resolve_model_chain(claude_model_name)
@@ -114,6 +142,31 @@ class ModelRouter:
                 resolved_chain[0].provider_model,
             )
         return tuple(resolved_chain)
+
+    def _fallback_refs_after(self, direct_ref: str) -> tuple[str, ...]:
+        """Return the refs that follow ``direct_ref`` in the first configured chain
+        that contains it. Searches MODEL_OPUS, MODEL_SONNET, MODEL_HAIKU, MODEL in
+        that order. Returns an empty tuple if no chain has the ref with a non-empty
+        tail (i.e. nothing to fall over to).
+        """
+        candidates = (
+            self._settings.model_opus,
+            self._settings.model_sonnet,
+            self._settings.model_haiku,
+            self._settings.model,
+        )
+        for chain_value in candidates:
+            if not chain_value:
+                continue
+            chain = Settings.split_model_chain(chain_value)
+            try:
+                index = chain.index(direct_ref)
+            except ValueError:
+                continue
+            tail = chain[index + 1 :]
+            if tail:
+                return tail
+        return ()
 
     def _direct_provider_model(
         self, model_name: str
