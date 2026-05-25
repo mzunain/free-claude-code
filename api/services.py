@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import traceback
@@ -16,7 +17,7 @@ from loguru import logger
 
 from config.settings import Settings
 from core.anthropic import get_token_count, get_user_facing_error_message
-from core.anthropic.sse import ANTHROPIC_SSE_RESPONSE_HEADERS
+from core.anthropic.sse import ANTHROPIC_SSE_RESPONSE_HEADERS, format_sse_event
 from core.trace import api_messages_request_snapshot, trace_event, traced_async_stream
 from providers.base import BaseProvider
 from providers.exceptions import (
@@ -268,6 +269,99 @@ async def _continue_stream(
         yield chunk
 
 
+# After ``STREAM_COMMIT`` we have already forwarded SSE bytes to the client and
+# cannot transparently swap to another provider candidate without producing a
+# malformed Anthropic Messages stream (duplicate ``message_start``, dangling
+# content blocks, mismatched indices). Instead we trap the upstream transport
+# failure and emit a top-level Anthropic ``event: error`` so Claude Code parses
+# a structured error and applies its own retry policy, rather than seeing a
+# truncated chunked-transfer body ("incomplete chunked read").
+_MID_STREAM_TRANSPORT_TYPES: tuple[type[BaseException], ...] = (
+    httpx.RemoteProtocolError,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.ReadTimeout,
+    httpx.WriteTimeout,
+    httpx.PoolTimeout,
+    httpx.NetworkError,
+    ConnectionError,
+)
+
+
+def _mid_stream_error_message(
+    exc: BaseException, provider_label: str | None
+) -> str:
+    """Human-readable summary of a mid-stream drop for the SSE error event."""
+    if isinstance(exc, httpx.RemoteProtocolError):
+        base = "Upstream connection dropped mid-stream"
+    elif isinstance(exc, (httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout)):
+        base = f"Upstream stream timed out ({type(exc).__name__})"
+    elif isinstance(exc, (httpx.ReadError, httpx.WriteError, httpx.NetworkError)):
+        base = f"Upstream network error ({type(exc).__name__})"
+    elif isinstance(exc, ConnectionError):
+        base = "Upstream connection error"
+    else:
+        detail = str(exc)[:200]
+        base = f"Upstream stream error ({type(exc).__name__}): {detail}".rstrip(": ")
+    return f"{base} (via {provider_label})" if provider_label else base
+
+
+def _format_mid_stream_error_event(
+    exc: BaseException, provider_label: str | None
+) -> str:
+    """Build a top-level Anthropic SSE ``event: error`` frame for a mid-stream drop."""
+    return format_sse_event(
+        "error",
+        {
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": _mid_stream_error_message(exc, provider_label),
+            },
+        },
+    )
+
+
+async def _stream_with_mid_drop_recovery(
+    inner: AsyncIterator[str],
+    request_id: str,
+    provider_label: str | None,
+) -> AsyncIterator[str]:
+    """Yield from ``inner``; on post-commit transport failure emit a clean SSE error.
+
+    This guarantees Claude Code (or any other client) always sees a well-formed
+    Anthropic Messages SSE stream: either the upstream completes normally, or we
+    finish with a parseable ``event: error`` frame that the client can act on.
+    Without this wrapper, an upstream ``RemoteProtocolError`` would propagate out
+    of the response generator and Starlette would slam the chunked body shut, so
+    the client only ever sees ``peer closed connection without sending complete
+    message body``.
+    """
+    try:
+        async for chunk in inner:
+            yield chunk
+    except asyncio.CancelledError:
+        raise
+    except _MID_STREAM_TRANSPORT_TYPES as exc:
+        logger.warning(
+            "MID_STREAM_DROP: request_id={} provider={} exc={} msg={}",
+            request_id,
+            provider_label or "unknown",
+            type(exc).__name__,
+            str(exc)[:200],
+        )
+        yield _format_mid_stream_error_event(exc, provider_label)
+    except Exception as exc:
+        logger.warning(
+            "MID_STREAM_ERROR: request_id={} provider={} exc={} msg={}",
+            request_id,
+            provider_label or "unknown",
+            type(exc).__name__,
+            str(exc)[:200],
+        )
+        yield _format_mid_stream_error_event(exc, provider_label)
+
+
 def _require_non_empty_messages(messages: list[Any]) -> None:
     if not messages:
         raise InvalidRequestError("messages cannot be empty")
@@ -429,6 +523,7 @@ class ClaudeProxyService:
             gateway_model=routed.request.model,
             thinking_enabled=resolved.thinking_enabled,
         )
+        candidate_tag = f"{resolved.provider_id}/{resolved.provider_model}"
         with logger.contextualize(request_id=request_id):
             logger.info(
                 "API_REQUEST: request_id={} model={} messages={}",
@@ -459,7 +554,9 @@ class ClaudeProxyService:
                     "gateway_model": routed.request.model,
                 },
             )
-            return anthropic_sse_streaming_response(streamed)
+            return anthropic_sse_streaming_response(
+                _stream_with_mid_drop_recovery(streamed, request_id, candidate_tag)
+            )
 
     async def _stream_with_fallback(
         self,
@@ -615,7 +712,12 @@ class ClaudeProxyService:
                         "gateway_model": routed.request.model,
                     },
                 )
-                async for chunk in streamed:
+                # Post-commit: cannot silently swap candidates. Convert mid-stream
+                # transport drops into a clean Anthropic SSE error so the client
+                # parses a structured error instead of an aborted chunked body.
+                async for chunk in _stream_with_mid_drop_recovery(
+                    streamed, request_id, candidate_tag
+                ):
                     yield chunk
                 return
 
