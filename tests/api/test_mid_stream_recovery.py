@@ -204,6 +204,67 @@ async def test_recovery_yields_error_when_drop_happens_before_first_chunk():
     assert event == "error"
 
 
+@pytest.mark.asyncio
+async def test_recovery_invokes_on_drop_callback_with_exception():
+    """The on_drop hook fires with the captured exception so callers can mark cooldown."""
+
+    captured: list[BaseException] = []
+
+    async def drops() -> AsyncIterator[str]:
+        yield "event: message_start\ndata: {}\n\n"
+        raise httpx.RemoteProtocolError("dead peer")
+
+    await _collect(
+        _stream_with_mid_drop_recovery(
+            drops(),
+            "req_test",
+            "nvidia_nim/qwen",
+            on_drop=captured.append,
+        )
+    )
+    assert len(captured) == 1
+    assert isinstance(captured[0], httpx.RemoteProtocolError)
+
+
+@pytest.mark.asyncio
+async def test_recovery_on_drop_callback_is_optional():
+    """Wrapper still works without an on_drop hook."""
+
+    async def drops() -> AsyncIterator[str]:
+        if False:
+            yield ""
+        raise httpx.ReadTimeout("slow")
+
+    # Just confirm it doesn't blow up when on_drop is None (the default).
+    chunks = await _collect(
+        _stream_with_mid_drop_recovery(drops(), "req_test", "p/m")
+    )
+    assert len(chunks) == 1
+
+
+@pytest.mark.asyncio
+async def test_recovery_swallows_exceptions_raised_by_on_drop_callback():
+    """A buggy on_drop callback must not prevent the clean SSE error from being emitted."""
+
+    def bad_callback(_exc: BaseException) -> None:
+        raise RuntimeError("callback exploded")
+
+    async def drops() -> AsyncIterator[str]:
+        if False:
+            yield ""
+        raise httpx.RemoteProtocolError("dead peer")
+
+    chunks = await _collect(
+        _stream_with_mid_drop_recovery(
+            drops(), "req_test", "p/m", on_drop=bad_callback
+        )
+    )
+    # Still get the clean error frame
+    assert len(chunks) == 1
+    event, _ = _parse_sse_event(chunks[0])
+    assert event == "error"
+
+
 # ---- _MID_STREAM_TRANSPORT_TYPES ---------------------------------------------
 
 

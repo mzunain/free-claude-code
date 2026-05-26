@@ -30,6 +30,7 @@ from providers.exceptions import (
     ServiceUnavailableError,
 )
 
+from .cooldown import CooldownStore, candidate_key
 from .model_router import ModelRouter, RoutedMessagesRequest
 from .models.anthropic import MessagesRequest, TokenCountRequest
 from .models.responses import TokenCountResponse
@@ -326,6 +327,7 @@ async def _stream_with_mid_drop_recovery(
     inner: AsyncIterator[str],
     request_id: str,
     provider_label: str | None,
+    on_drop: Callable[[BaseException], None] | None = None,
 ) -> AsyncIterator[str]:
     """Yield from ``inner``; on post-commit transport failure emit a clean SSE error.
 
@@ -336,6 +338,10 @@ async def _stream_with_mid_drop_recovery(
     of the response generator and Starlette would slam the chunked body shut, so
     the client only ever sees ``peer closed connection without sending complete
     message body``.
+
+    ``on_drop`` is invoked once with the captured exception when a mid-stream
+    failure occurs (any post-commit ``Exception`` except ``CancelledError``),
+    giving the caller a hook to record provider-level state such as a cooldown.
     """
     try:
         async for chunk in inner:
@@ -350,6 +356,9 @@ async def _stream_with_mid_drop_recovery(
             type(exc).__name__,
             str(exc)[:200],
         )
+        if on_drop is not None:
+            with contextlib.suppress(Exception):
+                on_drop(exc)
         yield _format_mid_stream_error_event(exc, provider_label)
     except Exception as exc:
         logger.warning(
@@ -359,6 +368,9 @@ async def _stream_with_mid_drop_recovery(
             type(exc).__name__,
             str(exc)[:200],
         )
+        if on_drop is not None:
+            with contextlib.suppress(Exception):
+                on_drop(exc)
         yield _format_mid_stream_error_event(exc, provider_label)
 
 
@@ -376,11 +388,40 @@ class ClaudeProxyService:
         provider_getter: ProviderGetter,
         model_router: ModelRouter | None = None,
         token_counter: TokenCounter = get_token_count,
+        cooldown_store: CooldownStore | None = None,
     ):
         self._settings = settings
         self._provider_getter = provider_getter
         self._model_router = model_router or ModelRouter(settings)
         self._token_counter = token_counter
+        self._cooldown = cooldown_store or CooldownStore(
+            default_seconds=settings.provider_cooldown_seconds,
+        )
+
+    @property
+    def cooldown(self) -> CooldownStore:
+        """Cooldown store used to demote recently-failed candidates."""
+        return self._cooldown
+
+    def _mark_candidate_cooldown(
+        self,
+        resolved_candidate: RoutedMessagesRequest,
+        *,
+        reason: str,
+    ) -> None:
+        """Record a retryable failure for ``resolved_candidate`` so the next request
+        prefers a different provider in the chain."""
+        key = candidate_key(
+            resolved_candidate.resolved.provider_id,
+            resolved_candidate.resolved.provider_model,
+        )
+        self._cooldown.mark(key)
+        logger.info(
+            "PROVIDER_COOLDOWN: candidate={} reason={} seconds={}",
+            key,
+            reason,
+            self._cooldown.default_seconds,
+        )
 
     async def create_message_non_streaming(
         self, request_data: MessagesRequest
@@ -555,7 +596,14 @@ class ClaudeProxyService:
                 },
             )
             return anthropic_sse_streaming_response(
-                _stream_with_mid_drop_recovery(streamed, request_id, candidate_tag)
+                _stream_with_mid_drop_recovery(
+                    streamed,
+                    request_id,
+                    candidate_tag,
+                    on_drop=lambda _exc: self._mark_candidate_cooldown(
+                        routed, reason="mid_stream_drop"
+                    ),
+                )
             )
 
     async def _stream_with_fallback(
@@ -568,8 +616,39 @@ class ClaudeProxyService:
         Only fires fallback before any SSE bytes commit to the client. Each provider
         is asked to ``raise_pre_stream_errors`` so an upstream 429/5xx/auth/conversion
         failure surfaces as an exception we can catch and route to the next candidate.
+
+        Candidates that recently failed (rate-limited, dropped mid-stream, 5xx,
+        transport error) are demoted to the tail of the chain via
+        :class:`providers.cooldown.CooldownStore`, so a fresh request prefers a
+        known-good provider rather than re-hitting the same upstream that just
+        failed. The cooldown window is :setting:`PROVIDER_COOLDOWN_SECONDS`.
         """
         last_error: BaseException | None = None
+        ordered = tuple(
+            self._cooldown.reorder(
+                candidates,
+                key=lambda c: candidate_key(
+                    c.resolved.provider_id, c.resolved.provider_model
+                ),
+            )
+        )
+        if (
+            len(ordered) > 1
+            and ordered[0] is not candidates[0]
+        ):
+            logger.info(
+                "CHAIN_REORDER: request_id={} primary='{}' -> '{}' (cooldown-demoted)",
+                request_id,
+                candidate_key(
+                    candidates[0].resolved.provider_id,
+                    candidates[0].resolved.provider_model,
+                ),
+                candidate_key(
+                    ordered[0].resolved.provider_id,
+                    ordered[0].resolved.provider_model,
+                ),
+            )
+        candidates = ordered
         total = len(candidates)
         single = total == 1
         for i, routed in enumerate(candidates):
@@ -612,6 +691,9 @@ class ClaudeProxyService:
                     type(e).__name__,
                     getattr(e, "status_code", "n/a"),
                 )
+                self._mark_candidate_cooldown(
+                    routed, reason=f"preflight_{type(e).__name__}"
+                )
                 continue
             except Exception as e:
                 last_error = e
@@ -623,6 +705,9 @@ class ClaudeProxyService:
                     i + 1,
                     total,
                     type(e).__name__,
+                )
+                self._mark_candidate_cooldown(
+                    routed, reason=f"preflight_{type(e).__name__}"
                 )
                 continue
 
@@ -677,6 +762,9 @@ class ClaudeProxyService:
                         type(e).__name__,
                         getattr(e, "status_code", "n/a"),
                     )
+                    self._mark_candidate_cooldown(
+                        routed, reason=f"pre_commit_{type(e).__name__}"
+                    )
                     continue
                 except Exception as e:
                     last_error = e
@@ -688,6 +776,9 @@ class ClaudeProxyService:
                         i + 1,
                         total,
                         type(e).__name__,
+                    )
+                    self._mark_candidate_cooldown(
+                        routed, reason=f"pre_commit_{type(e).__name__}"
                     )
                     continue
 
@@ -715,8 +806,16 @@ class ClaudeProxyService:
                 # Post-commit: cannot silently swap candidates. Convert mid-stream
                 # transport drops into a clean Anthropic SSE error so the client
                 # parses a structured error instead of an aborted chunked body.
+                # We also mark the candidate as cooled-down so the client's retry
+                # prefers the next provider in the chain.
+                routed_for_callback = routed
                 async for chunk in _stream_with_mid_drop_recovery(
-                    streamed, request_id, candidate_tag
+                    streamed,
+                    request_id,
+                    candidate_tag,
+                    on_drop=lambda _exc, _r=routed_for_callback: self._mark_candidate_cooldown(
+                        _r, reason="mid_stream_drop"
+                    ),
                 ):
                     yield chunk
                 return

@@ -191,6 +191,9 @@ class Settings(BaseSettings):
     provider_max_concurrency: int = Field(
         default=5, validation_alias="PROVIDER_MAX_CONCURRENCY"
     )
+    provider_cooldown_seconds: float = Field(
+        default=30.0, validation_alias="PROVIDER_COOLDOWN_SECONDS"
+    )
     enable_model_thinking: bool = Field(
         default=True, validation_alias="ENABLE_MODEL_THINKING"
     )
